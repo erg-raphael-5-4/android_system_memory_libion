@@ -68,6 +68,10 @@ int ion_close(int fd) {
     return ret;
 }
 
+/* See the ENODEV fallback in ion_alloc_fd(). */
+#define ION_LEGACY_QSECOM_HEAP_MASK (1u << 27)
+#define ION_QSECOM_HEAP_MASK        (1u << 7)
+
 static int ion_ioctl(int fd, int req, void* arg) {
     int ret = ioctl(fd, req, arg);
     if (ret < 0) {
@@ -179,6 +183,28 @@ int ion_alloc_fd(int fd, size_t len, size_t align, unsigned int heap_mask, unsig
         };
 
         ret = ion_ioctl(fd, ION_IOC_NEW_ALLOC, &data);
+        /*
+         * Legacy QSEECOM heap-id fallback.
+         *
+         * msm_ion_ids.h defines ION_QSECOM_HEAP_ID as ION_BIT(7), and the
+         * kernel's ion.c assigns heap->id = __ffs(heap->id), so the QSEECOM
+         * heap is registered at runtime id 7. Some vendor blobs predate that
+         * numbering and still ask for the old plain heap id 27 -- notably the
+         * Goodix FOD stack on sm8150 (libgf_hal.so), which fails as:
+         *
+         *   ion: ioctl c0184900 failed with code -1: No such device
+         *   [IonMemory] ion_alloc_fd for heap 27 ... ret = -19, errno = 19
+         *
+         * and leaves the fingerprint sensor dead. Only on ENODEV -- meaning
+         * no registered heap matched the mask at all -- retry once with bit 27
+         * translated to ION_QSECOM_HEAP_ID. Allocations that match a real heap
+         * are unaffected, so this costs nothing on the normal path.
+         */
+        if (ret == -ENODEV && (heap_mask & ION_LEGACY_QSECOM_HEAP_MASK)) {
+            data.heap_id_mask =
+                (heap_mask & ~ION_LEGACY_QSECOM_HEAP_MASK) | ION_QSECOM_HEAP_MASK;
+            ret = ion_ioctl(fd, ION_IOC_NEW_ALLOC, &data);
+        }
         if (ret < 0) return ret;
         *handle_fd = data.fd;
     } else {
